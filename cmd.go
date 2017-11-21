@@ -28,6 +28,7 @@ type Cmd struct {
 	stderr    *output
 	status    Status
 	doneChan  chan Status
+	Silent    bool
 }
 
 // Status represents the status of a Cmd. It is valid during the entire lifecycle
@@ -50,6 +51,7 @@ type Status struct {
 	Runtime  float64 // seconds
 	Stdout   []string
 	Stderr   []string
+	Silent   bool
 }
 
 // NewCmd creates a new Cmd for the given command name and arguments. The command
@@ -90,12 +92,29 @@ func (c *Cmd) Start() <-chan Status {
 	c.Lock()
 	defer c.Unlock()
 
+	c.Silent = false
+
 	if c.doneChan != nil {
 		return c.doneChan
 	}
 
 	c.doneChan = make(chan Status, 1)
-	go c.run()
+	go c.run(c.Silent)
+	return c.doneChan
+}
+
+func (c *Cmd) StartSilent() <-chan Status {
+	c.Lock()
+	defer c.Unlock()
+
+	c.Silent = true
+
+	if c.doneChan != nil {
+		return c.doneChan
+	}
+
+	c.doneChan = make(chan Status, 1)
+	go c.run(c.Silent)
 	return c.doneChan
 }
 
@@ -137,8 +156,11 @@ func (c *Cmd) Status() Status {
 	if c.done {
 		// No longer running
 		if !c.final {
-			c.status.Stdout = c.stdout.Lines()
-			c.status.Stderr = c.stderr.Lines()
+
+			if !c.Silent {
+				c.status.Stdout = c.stdout.Lines()
+				c.status.Stderr = c.stderr.Lines()
+			}
 
 			c.stdout = nil // release buffers
 			c.stderr = nil
@@ -147,9 +169,11 @@ func (c *Cmd) Status() Status {
 		}
 	} else {
 		// Still running
-		c.status.Runtime = time.Now().Sub(c.startTime).Seconds()
-		c.status.Stdout = c.stdout.Lines()
-		c.status.Stderr = c.stderr.Lines()
+		if !c.Silent {
+			c.status.Runtime = time.Now().Sub(c.startTime).Seconds()
+			c.status.Stdout = c.stdout.Lines()
+			c.status.Stderr = c.stderr.Lines()
+		}
 	}
 
 	return c.status
@@ -157,7 +181,7 @@ func (c *Cmd) Status() Status {
 
 // --------------------------------------------------------------------------
 
-func (c *Cmd) run() {
+func (c *Cmd) run(quiet bool) {
 	defer func() {
 		c.doneChan <- c.Status() // unblocks Start if caller is waiting
 	}()
@@ -170,14 +194,23 @@ func (c *Cmd) run() {
 	// Set process group ID so the cmd and all its children become a new
 	// process grouc. This allows Stop to SIGTERM thei cmd's process group
 	// without killing this process (i.e. this code here).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 
 	// Write stdout and stderr to buffers that are safe to read while writing
 	// and don't cause a race condition.
-	c.stdout = newOutput()
-	c.stderr = newOutput()
-	cmd.Stdout = c.stdout
-	cmd.Stderr = c.stderr
+	if !quiet {
+		c.stdout = newOutput()
+		c.stderr = newOutput()
+		cmd.Stdout = c.stdout
+		cmd.Stderr = c.stderr
+	} else {
+		c.stderr = nil
+		c.stdout = nil
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	}
 
 	// //////////////////////////////////////////////////////////////////////
 	// Start command
